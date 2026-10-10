@@ -84,6 +84,11 @@ class ExploreController:
     # time we update the pose. Used to deprioritise re-revisiting
     # already-cleared areas when multiple frontiers tie in score.
     VISITED_RADIUS_M = 0.4
+    # The lidar's near-field blind zone leaves the ground around the robot
+    # unknown in the map. Cells within this radius of the robot, and every
+    # visited cell, count as free when looking for frontiers; otherwise the
+    # robot is ringed by frontier cells no goal can clear.
+    BLIND_RADIUS_M = 0.6
     # Coverage tracking: each cell records which yaw sectors the
     # camera has pointed at. 8 sectors of 45° each. A cell with all
     # 8 sectors filled has been observed from every direction.
@@ -244,6 +249,16 @@ class ExploreController:
             self._latest_pose_xyyaw = (x, y, yaw)
             self._mark_visited(x, y, yaw)
 
+    def _blind_cells(self, gv, pose) -> set:
+        """Cells within BLIND_RADIUS_M of `pose`; empty without a pose."""
+        if pose is None:
+            return set()
+        cx, cy = gv.world_to_cell(pose[0], pose[1])
+        r = max(1, int(round(self.BLIND_RADIUS_M / gv.resolution)))
+        return {(cx + dx, cy + dy)
+                for dy in range(-r, r + 1) for dx in range(-r, r + 1)
+                if dx * dx + dy * dy <= r * r}
+
     def _mark_visited(self, x: float, y: float, yaw: float) -> None:
         """Stamp visited cells (radius-disk) and add the current yaw
         sector to the per-cell coverage map. Called with self._lock."""
@@ -328,8 +343,8 @@ class ExploreController:
 
     # ── Frontier loop (runs in its own thread per task) ─────────────
     def _run_task(self, handle: TaskHandle) -> None:
-        from .frontier import (GridView, mapped_free_area_m2, pick_target,
-                                total_frontier_count)
+        from .frontier import (GridView, fill_traversed, mapped_free_area_m2,
+                                pick_target, total_frontier_count)
         log.info("[%s] exploration task starting", handle.task_id)
         # Capture initial state once map is available.
         gm = self._wait_for_map(timeout_s=15.0)
@@ -364,6 +379,10 @@ class ExploreController:
             pose = (pose_xyyaw[0], pose_xyyaw[1]) if pose_xyyaw else None
             gv = GridView.from_msg(latest)
             cur_area = mapped_free_area_m2(gv)
+            with self._lock:
+                visited_snapshot = set(self._visited_cells)
+            gv = fill_traversed(gv, visited_snapshot | self._blind_cells(
+                gv, pose))
             if cur_area - handle.last_area_m2 > self.PROGRESS_AREA_DELTA_M2:
                 handle.last_progress_t = time.time()
             handle.last_area_m2 = cur_area
@@ -383,8 +402,6 @@ class ExploreController:
                           handle.task_id)
                 time.sleep(0.5)
                 continue
-            with self._lock:
-                visited_snapshot = set(self._visited_cells)
             pick_kwargs = {"keepout": self._keepout_circles(),
                            "blocked_xy": handle.failed_targets,
                            "blocked_radius_m": self.FAILED_TARGET_RADIUS_M}

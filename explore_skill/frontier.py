@@ -24,6 +24,7 @@ dependency on inflation).
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
@@ -54,6 +55,17 @@ DEFAULT_CLEARANCE_M = ROBOT_RADIUS_M
 # the robot fits" is.
 DEFAULT_STANDOFF_M = 0.45
 _STANDOFF_STEP_M = 0.15
+# How far back along the line the search may go. The robot only has to see
+# the frontier, and the lidar reaches metres, so standing further back costs
+# little and buys room.
+_MAX_EXTRA_STANDOFF_STEPS = 8
+
+# Clearance worth having, as opposed to the clearance required. Among the
+# points that fit, the search takes the one furthest from anything occupied,
+# up to this. A chassis-height lidar sees only the legs of a table, so the
+# top reaches about half a table depth past the nearest occupied cell; a goal
+# at the bare chassis clearance from a leg is a goal under the table.
+DEFAULT_PREFERRED_CLEARANCE_M = 0.8
 
 
 @dataclass
@@ -105,6 +117,24 @@ class FrontierCluster:
     def drive_to(self) -> Tuple[float, float]:
         """The pose to navigate to — the standoff point where one exists."""
         return self.goal_xy or self.centroid_xy
+
+
+def fill_traversed(gv: GridView, cells) -> GridView:
+    """`gv` with unknown cells in `cells` marked free.
+
+    A lidar does not see the ground right around itself, so the patch the
+    robot stands on can stay unknown in the map however long it stands
+    there. That patch rings the robot with frontier cells that no goal can
+    ever clear, and the explorer keeps picking them. Cells the robot's own
+    body has occupied are free by demonstration. Occupied cells are left
+    as they are."""
+    data = gv.data.copy()
+    for cx, cy in cells:
+        if gv.in_bounds(cx, cy) and data[cy, cx] == -1:
+            data[cy, cx] = 0
+    return GridView(data=data, resolution=gv.resolution,
+                    origin_x=gv.origin_x, origin_y=gv.origin_y,
+                    width=gv.width, height=gv.height)
 
 
 def find_frontier_cells(gv: GridView) -> np.ndarray:
@@ -224,30 +254,53 @@ def is_target_safe(gv: GridView, wx: float, wy: float,
     return bool(np.all(patch[within] < OCC_THRESH))
 
 
+def clearance_at(gv: GridView, wx: float, wy: float,
+                  max_m: float) -> float:
+    """Distance from (wx, wy) to the nearest occupied cell, capped at
+    `max_m`. Unknown cells do not count: the goal is held back from the
+    frontier, and the frontier is unknown on one side by definition."""
+    cx, cy = gv.world_to_cell(wx, wy)
+    r = max(1, int(math.ceil(max_m / gv.resolution)))
+    y0, y1 = max(0, cy - r), min(gv.height, cy + r + 1)
+    x0, x1 = max(0, cx - r), min(gv.width,  cx + r + 1)
+    oy, ox = np.nonzero(gv.data[y0:y1, x0:x1] >= OCC_THRESH)
+    if oy.size == 0:
+        return max_m
+    d2 = (ox + x0 - cx) ** 2 + (oy + y0 - cy) ** 2
+    return min(max_m, float(np.sqrt(d2.min())) * gv.resolution)
+
+
 def approach_point(gv: GridView,
                     robot_xy: Tuple[float, float],
                     target_xy: Tuple[float, float],
                     *,
                     standoff_m: float,
                     clearance_m: float,
+                    preferred_clearance_m: float = DEFAULT_PREFERRED_CLEARANCE_M,
                     keepout: Optional[List[Tuple[float, float, float]]] = None
                     ) -> Optional[Tuple[float, float]]:
     """A point near `target_xy`, on the line back to the robot, that fits.
 
-    Starts at `standoff_m` and walks the line -- further back first, since
-    that is more observed ground, then closer in. Returns None only when no
-    point on the segment clears, which is a frontier genuinely unreachable
-    rather than one whose single sampled point happened to be against a wall.
+    Walks the line from `standoff_m` -- further back first, since that is
+    more observed ground, then closer in -- and takes the point with the
+    most room around it, up to `preferred_clearance_m`. Ties go to the
+    earlier point, so in open ground the nominal standoff is kept. Returns
+    None only when no point on the segment clears `clearance_m`, which is a
+    frontier genuinely unreachable rather than one whose single sampled
+    point happened to be against a wall.
 
     Testing one point and discarding the cluster on failure is what left the
-    explorer spinning with two dozen clusters in view.
+    explorer spinning with two dozen clusters in view; taking the first point
+    that fits is what parked it beside table legs.
     """
     offsets = [standoff_m]
     step = _STANDOFF_STEP_M
-    for i in range(1, 5):
+    for i in range(1, _MAX_EXTRA_STANDOFF_STEPS + 1):
         offsets.append(standoff_m + i * step)
-        offsets.append(max(0.0, standoff_m - i * step))
+        if i <= 4:
+            offsets.append(max(0.0, standoff_m - i * step))
     seen: set[int] = set()
+    best, best_room = None, -1.0
     for offset in offsets:
         key = int(round(offset * 100))
         if key in seen:
@@ -258,8 +311,12 @@ def approach_point(gv: GridView,
             continue
         if in_keepout(px, py, keepout):
             continue
-        return (px, py)
-    return None
+        room = clearance_at(gv, px, py, preferred_clearance_m)
+        if room > best_room:
+            best, best_room = (px, py), room
+        if room >= preferred_clearance_m:
+            break
+    return best
 
 
 def standoff_point(robot_xy: Tuple[float, float],
@@ -318,6 +375,7 @@ def score_clusters(clusters: List[FrontierCluster], gv: GridView,
                     visited_cells: Optional[set] = None,
                     visited_penalty_m: float = 1.5,
                     clearance_m: float = DEFAULT_CLEARANCE_M,
+                    preferred_clearance_m: float = DEFAULT_PREFERRED_CLEARANCE_M,
                     standoff_m: float = DEFAULT_STANDOFF_M,
                     keepout: Optional[List[Tuple[float, float, float]]] = None,
                     blocked_xy: Optional[Sequence[Tuple[float, float]]] = None,
@@ -326,6 +384,7 @@ def score_clusters(clusters: List[FrontierCluster], gv: GridView,
     """Score frontiers and rank descending. Score formula:
 
         score = info_gain / (travel + visited_penalty + 1)
+                * min(clearance, preferred_clearance) / preferred_clearance
 
     With these guards:
       - travel > max_distance_m → cluster dropped entirely (local
@@ -369,6 +428,7 @@ def score_clusters(clusters: List[FrontierCluster], gv: GridView,
         approach = approach_point(gv, robot_xy, (wx, wy),
                                    standoff_m=standoff_m,
                                    clearance_m=clearance_m,
+                                   preferred_clearance_m=preferred_clearance_m,
                                    keepout=keepout)
         if approach is None:
             continue                 # nowhere on the line fits — skip
@@ -386,7 +446,12 @@ def score_clusters(clusters: List[FrontierCluster], gv: GridView,
                 if penalty:
                     break
 
-        score = c_world.size / (travel + penalty + 1.0)
+        # A cramped goal is worth less than a roomy one: between two
+        # frontiers of equal promise, go where the robot keeps its distance.
+        room = clearance_at(gv, approach[0], approach[1],
+                            preferred_clearance_m)
+        score = (c_world.size / (travel + penalty + 1.0)
+                 * room / preferred_clearance_m)
         scored.append((score, c_world))
     scored.sort(key=lambda t: t[0], reverse=True)
     return scored
@@ -397,6 +462,7 @@ def pick_target(gv: GridView, robot_xy: Tuple[float, float], *,
                  max_distance_m: float = 8.0,
                  visited_cells: Optional[set] = None,
                  clearance_m: float = DEFAULT_CLEARANCE_M,
+                 preferred_clearance_m: float = DEFAULT_PREFERRED_CLEARANCE_M,
                  standoff_m: float = DEFAULT_STANDOFF_M,
                  keepout: Optional[List[Tuple[float, float, float]]] = None,
                  blocked_xy: Optional[Sequence[Tuple[float, float]]] = None,
@@ -414,6 +480,7 @@ def pick_target(gv: GridView, robot_xy: Tuple[float, float], *,
                              max_distance_m=max_distance_m,
                              visited_cells=visited_cells,
                              clearance_m=clearance_m,
+                             preferred_clearance_m=preferred_clearance_m,
                              standoff_m=standoff_m,
                              keepout=keepout,
                              blocked_xy=blocked_xy,
