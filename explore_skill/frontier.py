@@ -25,7 +25,7 @@ dependency on inflation).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -298,6 +298,20 @@ def in_keepout(x: float, y: float,
     return False
 
 
+def anchor_cell(c: FrontierCluster) -> Tuple[int, int]:
+    """Return the frontier cell of `c` closest to its cell-space mean.
+
+    The mean of a curved or ring-shaped cluster can fall inside the
+    unknown region or a wall it wraps around. Every member cell is
+    known free by construction, so goals anchored on one are never in
+    unknown space."""
+    cells = c.cell_indices
+    mx, my = c.centroid_xy
+    d2 = (cells[:, 0] - mx) ** 2 + (cells[:, 1] - my) ** 2
+    best = cells[int(np.argmin(d2))]
+    return int(best[0]), int(best[1])
+
+
 def score_clusters(clusters: List[FrontierCluster], gv: GridView,
                     robot_xy: Tuple[float, float], *,
                     max_distance_m: float = 8.0,
@@ -305,7 +319,9 @@ def score_clusters(clusters: List[FrontierCluster], gv: GridView,
                     visited_penalty_m: float = 1.5,
                     clearance_m: float = DEFAULT_CLEARANCE_M,
                     standoff_m: float = DEFAULT_STANDOFF_M,
-                    keepout: Optional[List[Tuple[float, float, float]]] = None
+                    keepout: Optional[List[Tuple[float, float, float]]] = None,
+                    blocked_xy: Optional[Sequence[Tuple[float, float]]] = None,
+                    blocked_radius_m: float = 1.0
                     ) -> List[Tuple[float, FrontierCluster]]:
     """Score frontiers and rank descending. Score formula:
 
@@ -322,22 +338,32 @@ def score_clusters(clusters: List[FrontierCluster], gv: GridView,
       - standoff point inside a keep-out circle → dropped. Those name
         obstacles the grid does not contain, a table under a
         chassis-height lidar being the case this was written for.
-      - centroid in/near a visited cell → travel penalty added so
+      - frontier within blocked_radius_m of a blocked_xy point → dropped.
+        The controller records frontiers the navigation service failed
+        to reach; the target moves a few cm between map updates, so an
+        exact match would never fire.
+      - frontier in/near a visited cell → travel penalty added so
         re-visiting unexplored fringes is preferred.
+
+    The target of a cluster is its anchor_cell(), returned as the
+    centroid_xy of the world-frame cluster.
 
     visited_cells is a set of (cx, cy) cell-space coordinates the
     skill has already driven through; the controller maintains it.
     """
+    blocked_r2 = blocked_radius_m * blocked_radius_m
     scored = []
     for c in clusters:
-        cx, cy = c.centroid_xy
-        wx, wy = gv.cell_to_world(int(round(cx)), int(round(cy)))
+        wx, wy = gv.cell_to_world(*anchor_cell(c))
         c_world = FrontierCluster(centroid_xy=(wx, wy),
                                   size=c.size,
                                   cell_indices=c.cell_indices)
         travel = ((wx - robot_xy[0]) ** 2 + (wy - robot_xy[1]) ** 2) ** 0.5
         if travel > max_distance_m:
             continue                             # too far — skip
+        if blocked_xy and any((wx - bx) ** 2 + (wy - by) ** 2 <= blocked_r2
+                              for bx, by in blocked_xy):
+            continue                             # nav already failed here
         # Checked where the robot will stand, not where the frontier is,
         # and along the whole line rather than at one point on it.
         approach = approach_point(gv, robot_xy, (wx, wy),
@@ -372,7 +398,9 @@ def pick_target(gv: GridView, robot_xy: Tuple[float, float], *,
                  visited_cells: Optional[set] = None,
                  clearance_m: float = DEFAULT_CLEARANCE_M,
                  standoff_m: float = DEFAULT_STANDOFF_M,
-                 keepout: Optional[List[Tuple[float, float, float]]] = None
+                 keepout: Optional[List[Tuple[float, float, float]]] = None,
+                 blocked_xy: Optional[Sequence[Tuple[float, float]]] = None,
+                 blocked_radius_m: float = 1.0
                  ) -> Optional[FrontierCluster]:
     """End-to-end convenience. Returns None if no SAFE frontier in
     range — caller may declare done."""
@@ -387,7 +415,9 @@ def pick_target(gv: GridView, robot_xy: Tuple[float, float], *,
                              visited_cells=visited_cells,
                              clearance_m=clearance_m,
                              standoff_m=standoff_m,
-                             keepout=keepout)
+                             keepout=keepout,
+                             blocked_xy=blocked_xy,
+                             blocked_radius_m=blocked_radius_m)
     return scored[0][1] if scored else None
 
 

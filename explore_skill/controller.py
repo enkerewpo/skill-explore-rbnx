@@ -32,7 +32,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 log = logging.getLogger("explore_rbnx.controller")
 
@@ -51,6 +51,11 @@ class TaskHandle:
     last_progress_t: float = field(default_factory=time.time)
     cancel_requested: bool = False
     legs_completed: int = 0           # successful nav legs in this task
+    # Goals the nav service failed to reach in this task. Frontiers
+    # near one of these are skipped by pick_target().
+    failed_targets: list = field(default_factory=list)
+    consecutive_nav_failures: int = 0
+    empty_sweeps: int = 0             # sweeps in a row that found no target
     thread: Optional[threading.Thread] = None
 
 
@@ -89,6 +94,18 @@ class ExploreController:
     # accumulating rotation drift and starving the global timeout.
     SWEEP_MIN_SECTORS = 6
     SWEEP_EVERY_N_LEGS = 3
+    # A frontier within this radius of one nav already failed to reach
+    # is skipped for the rest of the task.
+    # Cluster targets drift a few cm as the map updates, so the match
+    # has to be by distance, not identity.
+    FAILED_TARGET_RADIUS_M = 1.0
+    # Give up after this many nav failures in a row. Without a cap the
+    # loop re-sends unreachable goals until the global timeout, and the
+    # nav stack runs its recovery behaviours on every one.
+    MAX_CONSECUTIVE_NAV_FAILURES = 5
+    # Give up after this many in-place sweeps in a row that still leave
+    # no usable frontier.
+    MAX_EMPTY_SWEEPS = 2
 
     # How long a Scene object snapshot is reused before asking again.
     # Furniture does not move on the timescale of an exploration leg, and
@@ -120,7 +137,6 @@ class ExploreController:
         # deployment has no Scene, and exploration proceeds without the
         # extra keep-outs exactly as it did before.
         self._scene_endpoint = scene_objects_endpoint
-        self._scene_client = None
         self._keepout_cache: List[Tuple[float, float, float]] = []
         self._keepout_stamp = 0.0
         self._lock = threading.Lock()
@@ -143,11 +159,6 @@ class ExploreController:
 
         self._tf_buffer = None
         self._tf_listener = None
-
-        # MCP client for nav RPCs. fastmcp.Client provides a typed
-        # JSON-RPC over the streamable-http MCP transport. Lazy-init
-        # to avoid pulling fastmcp imports during module load.
-        self._mcp_client: Optional[Any] = None
 
     # ── ROS runtime ─────────────────────────────────────────────────
     def start_runtime(self) -> None:
@@ -384,8 +395,18 @@ class ExploreController:
                                   min_size=self.FRONTIER_MIN_SIZE_CELLS,
                                   max_distance_m=self.MAX_FRONTIER_DISTANCE_M,
                                   visited_cells=visited_snapshot,
+                                  blocked_xy=handle.failed_targets,
+                                  blocked_radius_m=self.FAILED_TARGET_RADIUS_M,
                                   **pick_kwargs)
             if target is None:
+                if handle.empty_sweeps >= self.MAX_EMPTY_SWEEPS:
+                    self._terminate(
+                        handle, "error",
+                        f"no reachable frontier after "
+                        f"{handle.empty_sweeps} sweeps ({n_frontiers} raw "
+                        f"clusters, {len(handle.failed_targets)} failed "
+                        f"targets)")
+                    return
                 # No safe frontier picked, but quiet timer hasn't fired
                 # yet → the map likely doesn't have ENOUGH known-free
                 # space around the robot for the safety filter to
@@ -399,10 +420,12 @@ class ExploreController:
                                   f"spinning to expand FOV ({n_frontiers} "
                                   f"raw clusters detected)")
                 log.info("[%s] %s", handle.task_id, handle.detail)
+                handle.empty_sweeps += 1
                 self._sweep_360(handle, deadline=deadline)
                 # After the spin, re-evaluate immediately rather than
                 # sleeping — the map should now be richer.
                 continue
+            handle.empty_sweeps = 0
 
             # The frontier is what was found; the standoff point is where
             # the robot goes. Reporting the first and driving to the second
@@ -429,13 +452,27 @@ class ExploreController:
                 return
             if not ok:
                 # Nav failed for this leg — that's not fatal, the next
-                # frontier might be reachable. Just log + continue.
-                log.warning("[%s] nav leg failed: %s", handle.task_id, msg)
+                # frontier might be reachable. Remember the frontier (not
+                # the standoff point, which moves with the robot) so it is
+                # not picked again, then continue.
+                handle.failed_targets.append((fx, fy))
+                handle.consecutive_nav_failures += 1
+                log.warning("[%s] nav leg failed: %s (%d in a row)",
+                            handle.task_id, msg,
+                            handle.consecutive_nav_failures)
+                if handle.consecutive_nav_failures >= \
+                        self.MAX_CONSECUTIVE_NAV_FAILURES:
+                    self._terminate(
+                        handle, "error",
+                        f"{handle.consecutive_nav_failures} nav legs failed "
+                        f"in a row; last: {msg}")
+                    return
                 handle.detail = f"nav leg failed ({msg}); trying next frontier"
                 time.sleep(self.LOOP_QUIET_PERIOD_S)
                 continue
 
             handle.legs_completed += 1
+            handle.consecutive_nav_failures = 0
 
             # 360° sweep to fill camera viewing-angle coverage at the
             # leg endpoint. Two triggers:
@@ -572,9 +609,9 @@ class ExploreController:
     def _scene_mcp_call(self, tool: str, args: dict) -> dict:
         """Scene is a different MCP server from navigation, so it gets its
         own client rather than borrowing the nav one's base URL."""
-        import asyncio
         try:
-            return asyncio.run(self._scene_mcp_call_async(tool, args))
+            return _run_coroutine_sync(
+                lambda: self._scene_mcp_call_async(tool, args))
         except Exception as error:  # noqa: BLE001
             log.warning("scene mcp call %s failed: %s", tool, error)
             return {}
@@ -584,9 +621,8 @@ class ExploreController:
 
         from fastmcp import Client
 
-        if self._scene_client is None:
-            self._scene_client = Client(self._scene_endpoint)
-        async with self._scene_client as c:
+        # A new Client per call, for the same reason as _mcp_call.
+        async with Client(self._scene_endpoint) as c:
             result = await c.call_tool(tool, args)
             if not result.content:
                 return {}
@@ -595,19 +631,16 @@ class ExploreController:
             except Exception:  # noqa: BLE001
                 return {}
 
-    def _ensure_mcp_client(self):
-        if self._mcp_client is not None:
-            return
-        from fastmcp import Client
-        # All three endpoints typically share the same base URL.
-        url = self._nav_endpoints["navigate"]
-        self._mcp_client = Client(url)
-
     async def _mcp_call(self, tool: str, args: dict) -> dict:
         """Single MCP tool round-trip. Async because fastmcp's client
-        is async — we await inside a fresh event loop in the caller."""
-        self._ensure_mcp_client()
-        async with self._mcp_client as c:
+        is async — we await inside a fresh event loop in the caller.
+
+        A new Client per call: calls come from the task thread and from
+        MCP handler threads, each with its own event loop, and every
+        call already opens its own MCP session."""
+        from fastmcp import Client
+        # All three endpoints typically share the same base URL.
+        async with Client(self._nav_endpoints["navigate"]) as c:
             result = await c.call_tool(tool, args)
             # FastMCP returns a list of TextContent; the tool returned
             # JSON-serialised dict in its sole entry.
@@ -621,9 +654,8 @@ class ExploreController:
                 return {"raw": txt}
 
     def _mcp_call_sync(self, tool: str, args: dict) -> dict:
-        import asyncio
         try:
-            return asyncio.run(self._mcp_call(tool, args))
+            return _run_coroutine_sync(lambda: self._mcp_call(tool, args))
         except Exception as e:  # noqa: BLE001
             log.warning("mcp call %s failed: %s", tool, e)
             return {}
@@ -677,6 +709,34 @@ class ExploreController:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+def _run_coroutine_sync(make_coro) -> Any:
+    """Run the coroutine returned by make_coro() to completion.
+
+    asyncio.run() refuses to start inside a running event loop, which
+    is where the MCP cancel handler calls cancel() from. In that case
+    run it on a short-lived thread with its own loop instead."""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(make_coro())
+
+    result: dict = {}
+
+    def runner() -> None:
+        try:
+            result["value"] = asyncio.run(make_coro())
+        except BaseException as e:  # noqa: BLE001
+            result["error"] = e
+
+    t = threading.Thread(target=runner, name="explore-mcp-call", daemon=True)
+    t.start()
+    t.join()
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
 def _frontiers_left_count(latest_map: Any) -> int:
     if latest_map is None:
         return -1
