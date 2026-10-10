@@ -61,10 +61,13 @@ def resolve_optional_inputs() -> dict[str, str]:
                      cid)
             continue
         ep = ch.endpoint
-        ch.close()
         if ep:
+            # Held open with the required inputs, see _input_channels.
+            _input_channels.append(ch)
             resolved[key] = ep
             log.info("resolved optional %s [%s] → %s", cid, transport, ep)
+        else:
+            ch.close()
     return resolved
 
 

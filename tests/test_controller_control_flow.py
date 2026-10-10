@@ -1,8 +1,24 @@
+import asyncio
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
+
 from explore_skill.controller import ExploreController, TaskHandle
+
+
+def _map_msg():
+    """OccupancyGrid-like message: free 10 m x 10 m room with two
+    unknown pockets, i.e. two separate frontier clusters."""
+    data = np.zeros((100, 100), dtype=np.int8)
+    data[20:30, 60:70] = -1
+    data[70:80, 60:70] = -1
+    origin = SimpleNamespace(position=SimpleNamespace(x=0.0, y=0.0))
+    info = SimpleNamespace(width=100, height=100, resolution=0.1,
+                           origin=origin)
+    return SimpleNamespace(info=info, data=data.tobytes())
 
 
 class _Grid:
@@ -79,6 +95,68 @@ class ExploreControlFlowTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(detail, "canceled during nav")
         self.assertIn(("cancel", {"run_id": "run-7"}), calls)
+
+
+    def _run_with_nav(self, nav):
+        self.controller._latest_map = _map_msg()
+        self.controller._latest_pose_xyyaw = (5.0, 5.0, 0.0)
+        self.controller.LOOP_QUIET_PERIOD_S = 0.0
+        self.controller._nav_navigate_blocking = nav
+        handle = self._handle()
+        self.controller._task = handle
+        self.controller._run_task(handle)
+        return handle
+
+    def test_failed_frontier_is_not_retried(self) -> None:
+        goals = []
+
+        def nav(x, y, *, yaw, timeout_s, cancel_evt):
+            goals.append((x, y, yaw))
+            return False, "nav terminal: FAILED"
+
+        handle = self._run_with_nav(nav)
+
+        legs = [(x, y) for x, y, yaw in goals if yaw is None]
+        self.assertEqual(len(legs), 2)
+        (ax, ay), (bx, by) = legs
+        self.assertGreater(((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5, 1.0)
+        # Both frontiers failed: a bounded number of sweeps, then give up
+        # instead of looping until the global timeout.
+        sweeps = [g for g in goals if g[2] is not None]
+        self.assertLessEqual(len(sweeps),
+                             4 * self.controller.MAX_EMPTY_SWEEPS)
+        self.assertEqual(handle.state, "error")
+        self.assertIn("no reachable frontier", handle.detail)
+
+    def test_consecutive_nav_failures_end_the_task(self) -> None:
+        legs = []
+
+        def nav(x, y, *, yaw, timeout_s, cancel_evt):
+            # Every frontier is unreachable, and there are always new
+            # ones: forget earlier failures so a fresh target exists.
+            cancel_evt.failed_targets.clear()
+            if yaw is None:
+                legs.append((x, y))
+            return False, "nav terminal: FAILED"
+
+        handle = self._run_with_nav(nav)
+
+        self.assertEqual(len(legs),
+                         self.controller.MAX_CONSECUTIVE_NAV_FAILURES)
+        self.assertEqual(handle.state, "error")
+        self.assertIn("nav legs failed in a row", handle.detail)
+
+    def test_mcp_call_works_inside_a_running_event_loop(self) -> None:
+        async def fake_call(tool, args):
+            return {"tool": tool, "args": args}
+
+        self.controller._mcp_call = fake_call
+
+        async def handler():
+            return self.controller._mcp_call_sync("cancel", {"run_id": ""})
+
+        self.assertEqual(asyncio.run(handler()),
+                         {"tool": "cancel", "args": {"run_id": ""}})
 
 
 if __name__ == "__main__":
