@@ -245,6 +245,36 @@ class ExploreControlFlowTest(unittest.TestCase):
         self.assertGreater(math.hypot(goals[0][0] - 1.0, goals[0][1] - 1.0),
                            self.controller.MAX_FRONTIER_DISTANCE_M)
 
+    def test_a_long_leg_gets_time_for_its_length(self) -> None:
+        """A fixed 60 s cut long legs short at the Lite3's 0.35 m/s, and
+        the frontier at the end was then blacklisted as unreachable."""
+        data = np.zeros((100, 100), dtype=np.int8)
+        data[85:95, 85:95] = -1
+        msg = _map_msg()
+        msg.data = data.tobytes()
+        legs = []
+
+        def nav(x, y, *, yaw, timeout_s, cancel_evt):
+            legs.append((x, y, timeout_s))
+            return True, "nav terminal: SUCCEEDED"
+
+        self.controller._latest_pose_xyyaw = (1.0, 1.0, 0.0)
+        self.controller._latest_map = msg
+        self.controller.LOOP_QUIET_PERIOD_S = 0.0
+        self.controller.NAV_GOAL_TIMEOUT_S = 10.0
+        self.controller._nav_navigate_blocking = nav
+        handle = self._handle()
+        handle.timeout_s = 3600.0
+        self.controller._task = handle
+        self.controller._run_task(handle)
+
+        x, y, timeout_s = legs[0]
+        # The path is searched from the robot's 0.1 m cell, so it can come
+        # out a little shorter than the straight line from the exact pose.
+        self.assertGreater(timeout_s, 0.95 *
+                           self.controller.LEG_TIMEOUT_PER_M_S *
+                           math.hypot(x - 1.0, y - 1.0))
+
     def test_a_hung_mcp_call_times_out(self) -> None:
         from explore_skill import controller as ctl
 

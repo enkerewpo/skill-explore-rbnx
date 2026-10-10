@@ -83,6 +83,10 @@ class ExploreController:
     PROGRESS_AREA_DELTA_M2 = 1.0          # area gain considered "progress"
     NAV_POLL_PERIOD_S = 1.0
     NAV_GOAL_TIMEOUT_S = 60.0             # per-leg cap; not the global timeout
+    # A long leg gets this much per metre of path on top: 2.5 times what
+    # the Lite3 needs at 0.35 m/s. A fixed 60 s cut legs through a maze
+    # short and blacklisted the frontier at their end.
+    LEG_TIMEOUT_PER_M_S = 7.0
     LOOP_QUIET_PERIOD_S = 2.0             # delay between consecutive goals
     # "Local exploration" radius: candidates farther than this from
     # current robot pose are skipped while nearer ones exist, so the skill
@@ -540,8 +544,13 @@ class ExploreController:
                              f"size={target.size}, {n_frontiers} clusters left")
             log.info("[%s] %s", handle.task_id, handle.detail)
 
+            # Straight-line distance times 1.5 stands in for the path when
+            # the strategy did not search for one.
+            leg_m = target.path_m if target.path_m is not None else \
+                1.5 * math.hypot(tx - pose[0], ty - pose[1])
             leg_timeout = self._bounded_timeout(
-                self.NAV_GOAL_TIMEOUT_S, deadline)
+                max(self.NAV_GOAL_TIMEOUT_S,
+                    self.LEG_TIMEOUT_PER_M_S * leg_m), deadline)
             if leg_timeout <= 0.0:
                 self._terminate(handle, "timeout",
                                 f"hit {handle.timeout_s}s ceiling")

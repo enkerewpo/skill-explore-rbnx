@@ -223,7 +223,7 @@ def _candidates(gv: GridView, robot_xy, *, min_size, robot_radius_m,
                                           center[1] - goal[1])
         out.append((FrontierCluster(centroid_xy=center, size=c.size,
                                     cell_indices=c.cell_indices,
-                                    goal_xy=goal),
+                                    goal_xy=goal, path_m=goal_path_m),
                     goal_path_m,
                     {"dm": dm, "centroid": centroid, "entry": entry}))
     return out
