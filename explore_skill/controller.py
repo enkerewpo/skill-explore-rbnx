@@ -60,6 +60,9 @@ class TaskHandle:
     # beyond lidar range, behind a wall the straight line ignores), so it
     # is skipped like a failed one.
     reached_targets: list = field(default_factory=list)
+    # Frontiers still there after a visit that were then visited again,
+    # this time from as close as the robot fits.
+    close_visits: list = field(default_factory=list)
     consecutive_nav_failures: int = 0
     empty_sweeps: int = 0             # sweeps in a row that found no target
     thread: Optional[threading.Thread] = None
@@ -101,6 +104,9 @@ class ExploreController:
     # visited cell, count as free when looking for frontiers; otherwise the
     # robot is ringed by frontier cells no goal can clear.
     BLIND_RADIUS_M = 0.6
+    # Frontiers at least this long (1 m on a 0.05 m map) get a second,
+    # close look when a visit leaves them in place.
+    CLOSE_LOOK_MIN_SIZE_CELLS = 20
     # Coverage tracking: each cell records which yaw sectors the
     # camera has pointed at. 8 sectors of 45° each. A cell with all
     # 8 sectors filled has been observed from every direction.
@@ -458,6 +464,19 @@ class ExploreController:
                 # Nothing near: look at the whole map before giving up.
                 target = pick_target(gv, pose, blocked_xy=tried,
                                       max_distance_m=math.inf, **pick_kwargs)
+            close = False
+            if target is None and handle.reached_targets:
+                # A frontier still there after a visit is often round a
+                # corner the goal could not see past. Go once more, as close
+                # to it as the robot fits.
+                # Only frontiers long enough to hide a passage; small ones
+                # left round table legs are not worth the trip.
+                target = pick_target(
+                    gv, pose, close=True, max_distance_m=math.inf,
+                    blocked_xy=handle.failed_targets + handle.close_visits,
+                    **{**pick_kwargs,
+                       "min_size": self.CLOSE_LOOK_MIN_SIZE_CELLS})
+                close = target is not None
             if target is None and tried and pick_target(
                     gv, pose, max_distance_m=math.inf,
                     **pick_kwargs) is not None:
@@ -469,8 +488,8 @@ class ExploreController:
                     handle, "done" if handle.reached_targets else "error",
                     f"{n_frontiers} clusters left, all tried: "
                     f"{len(handle.failed_targets)} unreachable, "
-                    f"{len(handle.reached_targets)} still there after a "
-                    f"visit")
+                    f"{len(set(handle.reached_targets))} still there after "
+                    f"a visit")
                 return
             if target is None and self.strategy != "frontier_greedy":
                 # These strategies search the map for a way to each
@@ -542,6 +561,8 @@ class ExploreController:
                 # frontier might be reachable. Remember the frontier so
                 # it is not picked again, then continue.
                 handle.failed_targets.append((fx, fy))
+                if close:
+                    handle.close_visits.append((fx, fy))
                 handle.consecutive_nav_failures += 1
                 log.warning("[%s] nav leg failed: %s (%d in a row)",
                             handle.task_id, msg,
@@ -560,6 +581,8 @@ class ExploreController:
             handle.legs_completed += 1
             handle.consecutive_nav_failures = 0
             handle.reached_targets.append((fx, fy))
+            if close:
+                handle.close_visits.append((fx, fy))
 
             # 360° sweep to fill camera viewing-angle coverage at the
             # leg endpoint. Two triggers:

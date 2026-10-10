@@ -146,7 +146,7 @@ class ExploreControlFlowTest(unittest.TestCase):
 
         handle = self._run_with_nav(nav)
 
-        self.assertEqual(len(goals), 2)
+        self.assertEqual(len(goals), 3)       # fail, visit, close look
         self.assertEqual(handle.state, "done")
         self.assertIn("1 unreachable, 1 still there after a visit",
                       handle.detail)
@@ -181,7 +181,9 @@ class ExploreControlFlowTest(unittest.TestCase):
 
         handle = self._run_with_nav(nav)
 
-        self.assertEqual(len(goals), 2)
+        # Each frontier once, then once more from as close as the robot
+        # fits, in case the first goal could not see round a corner.
+        self.assertEqual(len(goals), 4)
         self.assertEqual(handle.state, "done")
         self.assertIn("2 still there after a visit", handle.detail)
 
@@ -214,7 +216,9 @@ class ExploreControlFlowTest(unittest.TestCase):
         self.assertTrue(sent)
         for x, y, yaw, (fx, fy) in sent:
             self.assertIsNotNone(yaw)
-            self.assertAlmostEqual(yaw, math.atan2(fy - y, fx - x), places=6)
+            if math.hypot(fx - x, fy - y) > 0.1:   # a close look sits on it
+                self.assertAlmostEqual(yaw, math.atan2(fy - y, fx - x),
+                                       places=6)
 
     def test_a_frontier_out_of_local_range_is_still_explored(self) -> None:
         """The 6 m local radius is a preference. With nothing nearer, the
@@ -237,7 +241,7 @@ class ExploreControlFlowTest(unittest.TestCase):
         self.controller._task = handle
         self.controller._run_task(handle)
 
-        self.assertEqual(len(goals), 1)
+        self.assertGreaterEqual(len(goals), 1)
         self.assertGreater(math.hypot(goals[0][0] - 1.0, goals[0][1] - 1.0),
                            self.controller.MAX_FRONTIER_DISTANCE_M)
 
