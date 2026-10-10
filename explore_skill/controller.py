@@ -140,8 +140,15 @@ class ExploreController:
                  nav_navigate_endpoint: str,
                  nav_status_endpoint: str,
                  nav_cancel_endpoint: str,
-                 scene_objects_endpoint: Optional[str] = None):
+                 scene_objects_endpoint: Optional[str] = None,
+                 strategy: str = "nearest",
+                 robot_radius_m: Optional[float] = None):
+        from .frontier import ROBOT_RADIUS_M
+        from .strategies import validate
         self.map_topic = map_topic
+        # Which frontier to go to next; see strategies.py.
+        self.strategy = validate(strategy)
+        self.robot_radius_m = robot_radius_m or ROBOT_RADIUS_M
         # All three nav endpoints typically point at the same FastMCP
         # server (http://host:port/mcp/) — atlas hands us the URL each
         # tool registered under. Keep separate fields so a future
@@ -359,7 +366,15 @@ class ExploreController:
     # ── Frontier loop (runs in its own thread per task) ─────────────
     def _run_task(self, handle: TaskHandle) -> None:
         from .frontier import (GridView, fill_traversed, mapped_free_area_m2,
-                                pick_target, total_frontier_count)
+                                total_frontier_count)
+        from .strategies import pick
+
+        start_xy = None  # where the robot was when the task began
+
+        def pick_target(gv, pose, **kwargs):
+            return pick(self.strategy, gv, pose, robot_yaw=pose_xyyaw[2],
+                        start_xy=start_xy or pose,
+                        robot_radius_m=self.robot_radius_m, **kwargs)
         log.info("[%s] exploration task starting", handle.task_id)
         # Capture initial state once map is available.
         gm = self._wait_for_map(timeout_s=15.0)
@@ -393,6 +408,8 @@ class ExploreController:
                 time.sleep(0.5)
                 continue
             pose = (pose_xyyaw[0], pose_xyyaw[1]) if pose_xyyaw else None
+            if start_xy is None:
+                start_xy = pose
             gv = GridView.from_msg(latest)
             cur_area = mapped_free_area_m2(gv)
             with self._lock:
@@ -450,13 +467,24 @@ class ExploreController:
                     gv, pose, max_distance_m=math.inf,
                     **pick_kwargs) is not None:
                 # Every frontier left has been tried. Turning in place
-                # will not change that.
+                # will not change that. A run that got somewhere is done
+                # with a few corners it could not reach; one that reached
+                # nothing failed.
                 self._terminate(
-                    handle, "error" if handle.failed_targets else "done",
+                    handle, "done" if handle.reached_targets else "error",
                     f"{n_frontiers} clusters left, all tried: "
                     f"{len(handle.failed_targets)} unreachable, "
                     f"{len(handle.reached_targets)} still there after a "
                     f"visit")
+                return
+            if target is None and self.strategy != "frontier_greedy":
+                # These strategies search the map for a way to each
+                # frontier. None found is an answer, and turning in place
+                # will not change it.
+                self._terminate(
+                    handle, "done",
+                    f"{n_frontiers} clusters left, none reachable "
+                    f"(area={cur_area:.1f}m²)")
                 return
             if target is None:
                 if handle.empty_sweeps >= self.MAX_EMPTY_SWEEPS:

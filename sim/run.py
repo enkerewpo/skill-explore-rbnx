@@ -82,7 +82,8 @@ def reachable_free(world: World, robot: RobotParams) -> np.ndarray:
 
 
 def run(world: World, *, robot: Optional[RobotParams] = None,
-        timeout_s: float = 1800.0, scene: bool = False) -> Result:
+        timeout_s: float = 1800.0, scene: bool = False,
+        strategy: Optional[str] = None) -> Result:
     from explore_skill import controller as ctl
 
     robot = robot or RobotParams()
@@ -95,7 +96,9 @@ def run(world: World, *, robot: Optional[RobotParams] = None,
             nav_navigate_endpoint="sim://nav",
             nav_status_endpoint="sim://nav",
             nav_cancel_endpoint="sim://nav",
-            **({"scene_objects_endpoint": "sim://scene"} if scene else {}))
+            **({"scene_objects_endpoint": "sim://scene"} if scene else {}),
+            **({"strategy": strategy,
+                "robot_radius_m": robot.inscribed_m} if strategy else {}))
         mapper = Mapper(world, robot)
 
         def on_tick(x, y, yaw):
