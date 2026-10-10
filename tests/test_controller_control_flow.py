@@ -1,4 +1,5 @@
 import asyncio
+import math
 import time
 import unittest
 from types import SimpleNamespace
@@ -46,6 +47,7 @@ class ExploreControlFlowTest(unittest.TestCase):
 
     @patch("explore_skill.frontier.GridView.from_msg", return_value=_Grid())
     def test_sweep_requires_periodic_leg_and_missing_coverage(self, _grid) -> None:
+        self.controller.SWEEP_EVERY_N_LEGS = 3
         self.controller._viewed_sectors[(4, 7)] = set()
         self.assertFalse(self.controller._should_sweep(self._handle(1)))
         self.assertFalse(self.controller._should_sweep(self._handle(2)))
@@ -53,6 +55,13 @@ class ExploreControlFlowTest(unittest.TestCase):
 
         self.controller._viewed_sectors[(4, 7)] = set(range(6))
         self.assertFalse(self.controller._should_sweep(self._handle(3)))
+
+    @patch("explore_skill.frontier.GridView.from_msg", return_value=_Grid())
+    def test_periodic_sweep_is_off_by_default(self, _grid) -> None:
+        """A 360° lidar gains nothing from turning in place."""
+        self.controller._viewed_sectors[(4, 7)] = set()
+        for legs in range(1, 10):
+            self.assertFalse(self.controller._should_sweep(self._handle(legs)))
 
     def test_navigation_timeout_cancels_the_accepted_run(self) -> None:
         calls = []
@@ -97,8 +106,8 @@ class ExploreControlFlowTest(unittest.TestCase):
         self.assertIn(("cancel", {"run_id": "run-7"}), calls)
 
 
-    def _run_with_nav(self, nav):
-        self.controller._latest_map = _map_msg()
+    def _run_with_nav(self, nav, map_msg=None):
+        self.controller._latest_map = map_msg or _map_msg()
         self.controller._latest_pose_xyyaw = (5.0, 5.0, 0.0)
         self.controller.LOOP_QUIET_PERIOD_S = 0.0
         self.controller._nav_navigate_blocking = nav
@@ -116,17 +125,13 @@ class ExploreControlFlowTest(unittest.TestCase):
 
         handle = self._run_with_nav(nav)
 
-        legs = [(x, y) for x, y, yaw in goals if yaw is None]
-        self.assertEqual(len(legs), 2)
-        (ax, ay), (bx, by) = legs
+        self.assertEqual(len(goals), 2)
+        (ax, ay, _), (bx, by, _) = goals
         self.assertGreater(((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5, 1.0)
-        # Both frontiers failed: a bounded number of sweeps, then give up
-        # instead of looping until the global timeout.
-        sweeps = [g for g in goals if g[2] is not None]
-        self.assertLessEqual(len(sweeps),
-                             4 * self.controller.MAX_EMPTY_SWEEPS)
+        # Both frontiers failed: give up at once instead of turning in
+        # place or looping until the global timeout.
         self.assertEqual(handle.state, "error")
-        self.assertIn("no reachable frontier", handle.detail)
+        self.assertIn("all tried: 2 unreachable", handle.detail)
 
     def test_consecutive_nav_failures_end_the_task(self) -> None:
         legs = []
@@ -135,7 +140,7 @@ class ExploreControlFlowTest(unittest.TestCase):
             # Every frontier is unreachable, and there are always new
             # ones: forget earlier failures so a fresh target exists.
             cancel_evt.failed_targets.clear()
-            if yaw is None:
+            if (x, y) != (5.0, 5.0):          # not a sweep at the pose
                 legs.append((x, y))
             return False, "nav terminal: FAILED"
 
@@ -145,6 +150,95 @@ class ExploreControlFlowTest(unittest.TestCase):
                          self.controller.MAX_CONSECUTIVE_NAV_FAILURES)
         self.assertEqual(handle.state, "error")
         self.assertIn("nav legs failed in a row", handle.detail)
+
+    def test_a_frontier_still_there_after_a_visit_is_not_revisited(self) -> None:
+        """Nav succeeds but the map never changes: glass, or open space
+        past the lidar's range. Each frontier is visited once, then the
+        task ends instead of creeping toward it 10 cm at a time."""
+        goals = []
+
+        def nav(x, y, *, yaw, timeout_s, cancel_evt):
+            goals.append((x, y))
+            return True, "nav terminal: SUCCEEDED"
+
+        handle = self._run_with_nav(nav)
+
+        self.assertEqual(len(goals), 2)
+        self.assertEqual(handle.state, "done")
+        self.assertIn("2 still there after a visit", handle.detail)
+
+    def test_a_map_without_frontiers_is_done_without_moving(self) -> None:
+        data = np.zeros((100, 100), dtype=np.int8)
+        msg = _map_msg()
+        msg.data = data.tobytes()
+        goals = []
+
+        def nav(x, y, *, yaw, timeout_s, cancel_evt):
+            goals.append((x, y))
+            return True, "nav terminal: SUCCEEDED"
+
+        handle = self._run_with_nav(nav, msg)
+
+        self.assertEqual(goals, [])
+        self.assertEqual(handle.state, "done")
+
+    def test_legs_face_the_frontier(self) -> None:
+        """No heading meant yaw 0, and the robot turned to face map +X at
+        the end of every leg."""
+        sent = []
+
+        def nav(x, y, *, yaw, timeout_s, cancel_evt):
+            sent.append((x, y, yaw, cancel_evt.last_target_xy))
+            return True, "nav terminal: SUCCEEDED"
+
+        self._run_with_nav(nav)
+
+        self.assertTrue(sent)
+        for x, y, yaw, (fx, fy) in sent:
+            self.assertIsNotNone(yaw)
+            self.assertAlmostEqual(yaw, math.atan2(fy - y, fx - x), places=6)
+
+    def test_a_frontier_out_of_local_range_is_still_explored(self) -> None:
+        """The 6 m local radius is a preference. With nothing nearer, the
+        far end of a corridor is the next goal, not a reason to stop."""
+        data = np.zeros((100, 100), dtype=np.int8)
+        data[85:95, 85:95] = -1
+        msg = _map_msg()
+        msg.data = data.tobytes()
+        goals = []
+
+        def nav(x, y, *, yaw, timeout_s, cancel_evt):
+            goals.append((x, y))
+            return True, "nav terminal: SUCCEEDED"
+
+        self.controller._latest_pose_xyyaw = (1.0, 1.0, 0.0)
+        self.controller._latest_map = msg
+        self.controller.LOOP_QUIET_PERIOD_S = 0.0
+        self.controller._nav_navigate_blocking = nav
+        handle = self._handle()
+        self.controller._task = handle
+        self.controller._run_task(handle)
+
+        self.assertEqual(len(goals), 1)
+        self.assertGreater(math.hypot(goals[0][0] - 1.0, goals[0][1] - 1.0),
+                           self.controller.MAX_FRONTIER_DISTANCE_M)
+
+    def test_a_hung_mcp_call_times_out(self) -> None:
+        from explore_skill import controller as ctl
+
+        async def hang(tool, args):
+            await asyncio.sleep(60)
+
+        self.controller._mcp_call = hang
+        with patch.object(ctl, "MCP_CALL_TIMEOUT_S", 0.05):
+            started = time.time()
+            self.assertEqual(self.controller._mcp_call_sync("status", {}), {})
+
+            async def handler():
+                return self.controller._mcp_call_sync("cancel", {})
+
+            self.assertEqual(asyncio.run(handler()), {})
+        self.assertLess(time.time() - started, 5.0)
 
     def test_mcp_call_works_inside_a_running_event_loop(self) -> None:
         async def fake_call(tool, args):

@@ -49,11 +49,17 @@ class TaskHandle:
     initial_area_m2: float = 0.0
     last_area_m2: float = 0.0
     last_progress_t: float = field(default_factory=time.time)
+    area_at_last_progress_m2: float = 0.0
     cancel_requested: bool = False
     legs_completed: int = 0           # successful nav legs in this task
     # Frontiers the nav service failed to reach in this task. Frontiers
     # near one of these are skipped by pick_target().
     failed_targets: list = field(default_factory=list)
+    # Frontiers the robot reached that are still there. One that survives
+    # a visit cannot be cleared from where the goal puts the robot (glass,
+    # beyond lidar range, behind a wall the straight line ignores), so it
+    # is skipped like a failed one.
+    reached_targets: list = field(default_factory=list)
     consecutive_nav_failures: int = 0
     empty_sweeps: int = 0             # sweeps in a row that found no target
     thread: Optional[threading.Thread] = None
@@ -64,15 +70,21 @@ class ExploreController:
     one active task at a time."""
 
     # Tunables
-    FRONTIER_MIN_SIZE_CELLS = 3           # below this = noise, ignore
-    DONE_QUIET_SECONDS = 30.0             # no progress for this long → done
+    # Below this = noise, ignore. One unknown cell between lidar rays makes
+    # a cluster of four, and with a minimum of three those speckles kept
+    # "done" from ever firing on a real map.
+    FRONTIER_MIN_SIZE_CELLS = 8
+    # Frontiers left but the map has not grown for this long: stop rather
+    # than wander until the global timeout.
+    NO_PROGRESS_TIMEOUT_S = 180.0
     PROGRESS_AREA_DELTA_M2 = 1.0          # area gain considered "progress"
     NAV_POLL_PERIOD_S = 1.0
     NAV_GOAL_TIMEOUT_S = 60.0             # per-leg cap; not the global timeout
     LOOP_QUIET_PERIOD_S = 2.0             # delay between consecutive goals
     # "Local exploration" radius: candidates farther than this from
-    # current robot pose are skipped. Forces the skill to clear the
-    # current room before jumping to a far-away frontier.
+    # current robot pose are skipped while nearer ones exist, so the skill
+    # clears the current room before jumping to a far-away frontier. When
+    # nothing is in range the whole map is searched.
     MAX_FRONTIER_DISTANCE_M = 6.0
     # Clearance demanded of a goal, and how far short of the frontier
     # line to stop. Defaults live in frontier.py next to the reasoning;
@@ -98,7 +110,10 @@ class ExploreController:
     # Previously the OR condition swept at every newly reached cell,
     # accumulating rotation drift and starving the global timeout.
     SWEEP_MIN_SECTORS = 6
-    SWEEP_EVERY_N_LEGS = 3
+    # 0 turns the periodic sweep off. The MID-360 already sees 360°, so
+    # turning in place after every few legs added nothing to the map and
+    # was most of what looked like the robot spinning.
+    SWEEP_EVERY_N_LEGS = 0
     # A frontier within this radius of one nav already failed to reach
     # is skipped for the rest of the task. Clusters drift a few cm as
     # the map updates, so the match has to be by distance, not identity.
@@ -355,6 +370,7 @@ class ExploreController:
         gv = GridView.from_msg(gm)
         handle.initial_area_m2 = mapped_free_area_m2(gv)
         handle.last_area_m2 = handle.initial_area_m2
+        handle.area_at_last_progress_m2 = handle.initial_area_m2
 
         deadline = handle.started_at + handle.timeout_s if handle.timeout_s > 0 else None
 
@@ -368,8 +384,8 @@ class ExploreController:
                                  f"hit {handle.timeout_s}s ceiling")
                 return
 
-            # Quiet-area check: if frontier count has been low + area
-            # hasn't grown for DONE_QUIET_SECONDS, declare done.
+            # Done when no frontier is left; stalled when the map stops
+            # growing for NO_PROGRESS_TIMEOUT_S.
             with self._lock:
                 latest = self._latest_map
                 pose_xyyaw = self._latest_pose_xyyaw
@@ -383,16 +399,28 @@ class ExploreController:
                 visited_snapshot = set(self._visited_cells)
             gv = fill_traversed(gv, visited_snapshot | self._blind_cells(
                 gv, pose))
-            if cur_area - handle.last_area_m2 > self.PROGRESS_AREA_DELTA_M2:
+            # Growth since the last progress, not since the last loop: a
+            # map that grows a little every loop is making progress.
+            if cur_area - handle.area_at_last_progress_m2 > \
+                    self.PROGRESS_AREA_DELTA_M2:
                 handle.last_progress_t = time.time()
+                handle.area_at_last_progress_m2 = cur_area
             handle.last_area_m2 = cur_area
             n_frontiers = total_frontier_count(
                 gv, min_size=self.FRONTIER_MIN_SIZE_CELLS)
-            if n_frontiers == 0 and \
-                    time.time() - handle.last_progress_t > self.DONE_QUIET_SECONDS:
+            # No frontier left is done, at once. Waiting for a quiet period
+            # first meant the last leg's own progress pushed the loop into
+            # two sweeps and an "error" for a fully explored map.
+            if n_frontiers == 0:
                 self._terminate(handle, "done",
-                                f"no frontiers + no progress for "
-                                f"{self.DONE_QUIET_SECONDS:.0f}s "
+                                f"no frontiers left (area={cur_area:.1f}m²)")
+                return
+            if time.time() - handle.last_progress_t > \
+                    self.NO_PROGRESS_TIMEOUT_S:
+                self._terminate(handle, "error",
+                                f"map has not grown for "
+                                f"{self.NO_PROGRESS_TIMEOUT_S:.0f}s with "
+                                f"{n_frontiers} clusters left "
                                 f"(area={cur_area:.1f}m²)")
                 return
 
@@ -402,18 +430,34 @@ class ExploreController:
                           handle.task_id)
                 time.sleep(0.5)
                 continue
+            tried = handle.failed_targets + handle.reached_targets
             pick_kwargs = {"keepout": self._keepout_circles(),
-                           "blocked_xy": handle.failed_targets,
+                           "min_size": self.FRONTIER_MIN_SIZE_CELLS,
+                           "visited_cells": visited_snapshot,
                            "blocked_radius_m": self.FAILED_TARGET_RADIUS_M}
             if self.TARGET_CLEARANCE_M is not None:
                 pick_kwargs["clearance_m"] = self.TARGET_CLEARANCE_M
             if self.TARGET_STANDOFF_M is not None:
                 pick_kwargs["standoff_m"] = self.TARGET_STANDOFF_M
-            target = pick_target(gv, pose,
-                                  min_size=self.FRONTIER_MIN_SIZE_CELLS,
+            target = pick_target(gv, pose, blocked_xy=tried,
                                   max_distance_m=self.MAX_FRONTIER_DISTANCE_M,
-                                  visited_cells=visited_snapshot,
                                   **pick_kwargs)
+            if target is None:
+                # Nothing near: look at the whole map before giving up.
+                target = pick_target(gv, pose, blocked_xy=tried,
+                                      max_distance_m=math.inf, **pick_kwargs)
+            if target is None and tried and pick_target(
+                    gv, pose, max_distance_m=math.inf,
+                    **pick_kwargs) is not None:
+                # Every frontier left has been tried. Turning in place
+                # will not change that.
+                self._terminate(
+                    handle, "error" if handle.failed_targets else "done",
+                    f"{n_frontiers} clusters left, all tried: "
+                    f"{len(handle.failed_targets)} unreachable, "
+                    f"{len(handle.reached_targets)} still there after a "
+                    f"visit")
+                return
             if target is None:
                 if handle.empty_sweeps >= self.MAX_EMPTY_SWEEPS:
                     self._terminate(
@@ -423,8 +467,8 @@ class ExploreController:
                         f"clusters, {len(handle.failed_targets)} failed "
                         f"targets)")
                     return
-                # No safe frontier picked, but quiet timer hasn't fired
-                # yet → the map likely doesn't have ENOUGH known-free
+                # Frontiers exist but none has a safe goal yet → the map
+                # likely doesn't have ENOUGH known-free
                 # space around the robot for the safety filter to
                 # accept a centroid. The right move is to spin in
                 # place: sweeping the lidar 360° at the current pose
@@ -460,9 +504,13 @@ class ExploreController:
                 self._terminate(handle, "timeout",
                                 f"hit {handle.timeout_s}s ceiling")
                 return
+            # Face the frontier. Leaving the heading out sent yaw 0, and
+            # the robot turned to face map +X at the end of every leg.
+            hx, hy = (tx, ty) if (fx - tx) ** 2 + (fy - ty) ** 2 > 0.01 \
+                else pose
             ok, msg = self._nav_navigate_blocking(
-                tx, ty, yaw=None, timeout_s=leg_timeout,
-                cancel_evt=handle)
+                tx, ty, yaw=math.atan2(fy - hy, fx - hx),
+                timeout_s=leg_timeout, cancel_evt=handle)
             if handle.cancel_requested:
                 self._terminate(handle, "canceled", "cancel during nav")
                 return
@@ -488,6 +536,7 @@ class ExploreController:
 
             handle.legs_completed += 1
             handle.consecutive_nav_failures = 0
+            handle.reached_targets.append((fx, fy))
 
             # 360° sweep to fill camera viewing-angle coverage at the
             # leg endpoint. Two triggers:
@@ -519,7 +568,7 @@ class ExploreController:
     # ── Sweep / coverage helpers ───────────────────────────────────
     def _should_sweep(self, handle: TaskHandle) -> bool:
         """Decide whether to do a 360° sweep at the current pose."""
-        if handle.legs_completed <= 0 or \
+        if self.SWEEP_EVERY_N_LEGS <= 0 or handle.legs_completed <= 0 or \
                 handle.legs_completed % self.SWEEP_EVERY_N_LEGS != 0:
             return False
         with self._lock:
@@ -681,10 +730,9 @@ class ExploreController:
         """Send a goal via the nav MCP `navigate` tool, then poll the
         sibling `status` tool until terminal or timeout."""
         # Navigate.srv carries a PoseStamped (`goal`) — encode xy in
-        # position and the optional yaw as a unit quaternion in
-        # orientation. simple_nav's atlas_bridge interprets the
-        # identity quat (z=0, w=1) as "no yaw constraint", so for
-        # legs that don't care about heading we leave it identity.
+        # position and yaw as a unit quaternion in orientation. The nav
+        # service reads the identity quaternion (yaw=None) as yaw 0, not
+        # as "any heading", so callers that care must pass one.
         if yaw is not None:
             qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
         else:
@@ -723,29 +771,42 @@ class ExploreController:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+# A hung nav or Scene server must not hang the task: without a bound the
+# task stayed "exploring" forever, cancel could not stop it, and start()
+# refused every new task.
+MCP_CALL_TIMEOUT_S = 10.0
+
+
 def _run_coroutine_sync(make_coro) -> Any:
-    """Run the coroutine returned by make_coro() to completion.
+    """Run the coroutine returned by make_coro() to completion, or raise
+    TimeoutError after MCP_CALL_TIMEOUT_S.
 
     asyncio.run() refuses to start inside a running event loop, which
     is where the MCP cancel handler calls cancel() from. In that case
     run it on a short-lived thread with its own loop instead."""
     import asyncio
+
+    def bounded():
+        return asyncio.wait_for(make_coro(), MCP_CALL_TIMEOUT_S)
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(make_coro())
+        return asyncio.run(bounded())
 
     result: dict = {}
 
     def runner() -> None:
         try:
-            result["value"] = asyncio.run(make_coro())
+            result["value"] = asyncio.run(bounded())
         except BaseException as e:  # noqa: BLE001
             result["error"] = e
 
     t = threading.Thread(target=runner, name="explore-mcp-call", daemon=True)
     t.start()
-    t.join()
+    t.join(MCP_CALL_TIMEOUT_S + 1.0)
+    if t.is_alive():
+        raise TimeoutError(f"mcp call did not finish in {MCP_CALL_TIMEOUT_S}s")
     if "error" in result:
         raise result["error"]
     return result.get("value")
