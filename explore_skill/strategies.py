@@ -4,21 +4,38 @@
     frontier_greedy  the original scorer in frontier.py: frontier size over
                      straight-line distance, goal on the straight line back
                      to the robot.
-    nearest          explore_lite's cost, potential_scale * distance -
-                     gain_scale * size, with the distance measured along a
-                     path instead of a straight line.
-    mrtsp            the start-node cost of the greedy MRTSP ordering in
-                     frontier_exploration_ros2: path cost minus sensor range
-                     over frontier size, plus a lower bound on the time to
-                     get there. Re-implemented from
-                     https://github.com/mertgulerx/frontier_exploration_ros2
-                     (Apache-2.0, Copyright 2026 Mert Güler).
+    mrtsp            the greedy MRTSP choice of frontier_exploration_ros2
+                     (https://github.com/mertgulerx/frontier_exploration_ros2,
+                     Apache-2.0, Copyright 2026 Mert Güler), after Liu et
+                     al., Sci Rep 15, 12261 (2025),
+                     doi:10.1038/s41598-025-97231-9.
+                     Re-implemented from src/mrtsp_ordering.cpp at 0d61180.
 
-`nearest` and `mrtsp` share the work frontier.py's scorer skips. Distances
-come from a search over the cells the robot fits in, so a frontier behind a
-wall is as far as the way round, and one with no way to it is dropped. The
-goal is a reachable cell near the frontier that sees it, with the most room
-around it.
+MRTSP, the minimum ratio travelling salesman problem, orders frontiers by
+cost over gain. The greedy solver's first target is the frontier with the
+lowest start-row cost
+
+    M(0, j) = wd * D(j) / P(j) + t_lb(j) / sqrt(P(j))
+    D(j)    = max(dm + du, dn + dv) - sensor_effective_range
+    t_lb(j) = path length / vmax + |heading change| / wmax
+
+where P(j) is the frontier's size in cells and
+
+    dm  path length from the robot to the frontier's center cell
+        (the frontier cell nearest its centroid)
+    dn  straight line from the robot to the centroid
+    du  center cell to the frontier's entry cell (the first one the search
+        reaches)
+    dv  centroid to the entry cell
+
+Only that first target is used: the robot replans after every leg, so the
+rest of the order would be thrown away.
+
+Path lengths come from a search over the cells the robot fits in, so a
+frontier behind a wall is as far as the way round, and one with no way to
+it is dropped. The goal is our own choice, not the package's: a reachable
+cell 0.9-2.0 m from the frontier that sees it, with the most room around
+it, then the shortest way from the robot.
 """
 from __future__ import annotations
 
@@ -33,7 +50,8 @@ from .frontier import (DEFAULT_PREFERRED_CLEARANCE_M, OCC_THRESH,
                        cluster_frontiers, find_frontier_cells, in_keepout,
                        pick_target)
 
-STRATEGIES = ("frontier_greedy", "nearest", "mrtsp")
+STRATEGIES = ("frontier_greedy", "mrtsp")
+DEFAULT_STRATEGY = "mrtsp"
 
 # The search runs on cells this many times coarser than the map: 0.1 m on
 # a 0.05 m map, a quarter of the cells to visit.
@@ -42,9 +60,8 @@ _COARSE = 2
 # lidar's blind zone (controller.BLIND_RADIUS_M): from closer in, the
 # frontier is under the robot and the visit cannot clear it.
 _GOAL_MIN_M, _GOAL_MAX_M = 0.9, 2.0
-# explore_lite's defaults.
-_POTENTIAL_SCALE, _GAIN_SCALE = 3.0, 1.0
 # frontier_exploration_ros2's defaults, with the Lite3's speeds.
+_WEIGHT_DISTANCE = 1.0
 _SENSOR_EFFECTIVE_RANGE_M = 1.5
 _VMAX, _WMAX = 0.35, 0.6
 # Goals closer than this to the robot do not move exploration on.
@@ -120,6 +137,14 @@ class _Reach:
                         heapq.heappush(pq, (nd, (nx, ny)))
         return dist * self.res
 
+    def path_m(self, xy: Tuple[float, float]) -> float:
+        """Path length to `xy`, or to the nearest cell around it the robot
+        fits in: frontier cells sit next to unknown, which is blocked."""
+        cx, cy = self.cell(*xy)
+        y0, x0 = max(0, cy - 1), max(0, cx - 1)
+        near = self.dist[y0:cy + 2, x0:cx + 2]
+        return float(near.min()) if near.size else math.inf
+
     def sees(self, a: Tuple[int, int], b: Tuple[int, int]) -> bool:
         n = max(abs(b[0] - a[0]), abs(b[1] - a[1]), 1)
         for i in range(1, n):
@@ -161,6 +186,7 @@ class _Reach:
 
 def _candidates(gv: GridView, robot_xy, *, min_size, robot_radius_m,
                 blocked_xy, blocked_radius_m, keepout):
+    """(cluster with its goal, path length to the goal, MRTSP terms)."""
     cells = find_frontier_cells(gv)
     if cells.size == 0:
         return []
@@ -174,44 +200,45 @@ def _candidates(gv: GridView, robot_xy, *, min_size, robot_radius_m,
         found = reach.goal_near(center, keepout)
         if found is None:
             continue
-        goal, path_m = found
-        mean = (gv.origin_x + (c.cell_indices[:, 0].mean() + 0.5) * gv.resolution,
-                gv.origin_y + (c.cell_indices[:, 1].mean() + 0.5) * gv.resolution)
+        goal, goal_path_m = found
+        res = gv.resolution
+        world = [(gv.origin_x + (x + 0.5) * res, gv.origin_y + (y + 0.5) * res)
+                 for x, y in c.cell_indices]
+        paths = [reach.path_m(p) for p in world]
+        entry = world[int(np.argmin(paths))]
+        centroid = (sum(p[0] for p in world) / len(world),
+                    sum(p[1] for p in world) / len(world))
+        dm = reach.path_m(center)
+        if not math.isfinite(dm):
+            dm = goal_path_m + math.hypot(center[0] - goal[0],
+                                          center[1] - goal[1])
         out.append((FrontierCluster(centroid_xy=center, size=c.size,
                                     cell_indices=c.cell_indices,
-                                    goal_xy=goal), path_m, mean))
+                                    goal_xy=goal),
+                    goal_path_m,
+                    {"dm": dm, "centroid": centroid, "entry": entry}))
     return out
 
 
-def _nearest_cost(cand, robot_xy, robot_yaw, start_xy, res):
-    cluster, path_m, _ = cand
-    return _POTENTIAL_SCALE * path_m - _GAIN_SCALE * cluster.size * res
-
-
-def _mrtsp_cost(cand, robot_xy, robot_yaw, start_xy, res):
-    # initial_frontier_path_cost: robot -> frontier -> where the run began,
-    # through the frontier's center cell and through its centroid.
-    cluster, path_m, mean = cand
+def _mrtsp_cost(cand, robot_xy, robot_yaw):
+    """compute_mrtsp_start_cost() in mrtsp_ordering.cpp, weights 1."""
+    cluster, _, t = cand
     gain = float(cluster.size)
-    center = cluster.centroid_xy
-    dm = path_m
-    dn = math.hypot(mean[0] - robot_xy[0], mean[1] - robot_xy[1])
-    du = math.hypot(center[0] - start_xy[0], center[1] - start_xy[1])
-    dv = math.hypot(mean[0] - start_xy[0], mean[1] - start_xy[1])
+    center, centroid, entry = cluster.centroid_xy, t["centroid"], t["entry"]
+    dm = t["dm"]
+    dn = math.hypot(centroid[0] - robot_xy[0], centroid[1] - robot_xy[1])
+    du = math.hypot(center[0] - entry[0], center[1] - entry[1])
+    dv = math.hypot(centroid[0] - entry[0], centroid[1] - entry[1])
     path_cost = max(dm + du, dn + dv) - _SENSOR_EFFECTIVE_RANGE_M
     heading = math.atan2(center[1] - robot_xy[1], center[0] - robot_xy[0])
     turn = abs(math.atan2(math.sin(heading - robot_yaw),
                           math.cos(heading - robot_yaw)))
     time_cost = dm / _VMAX + turn / _WMAX
-    return path_cost / gain + time_cost / math.sqrt(gain)
-
-
-_COSTS = {"nearest": _nearest_cost, "mrtsp": _mrtsp_cost}
+    return _WEIGHT_DISTANCE * path_cost / gain + time_cost / math.sqrt(gain)
 
 
 def pick(strategy: str, gv: GridView, robot_xy: Tuple[float, float], *,
          robot_yaw: float = 0.0,
-         start_xy: Optional[Tuple[float, float]] = None,
          min_size: int,
          robot_radius_m: float,
          max_distance_m: float = math.inf,
@@ -227,7 +254,6 @@ def pick(strategy: str, gv: GridView, robot_xy: Tuple[float, float], *,
                            visited_cells=visited_cells, blocked_xy=blocked_xy,
                            blocked_radius_m=blocked_radius_m, keepout=keepout,
                            **frontier_kwargs)
-    cost = _COSTS[strategy]
     cands = [c for c in _candidates(
         gv, robot_xy, min_size=min_size, robot_radius_m=robot_radius_m,
         blocked_xy=blocked_xy, blocked_radius_m=blocked_radius_m,
@@ -238,9 +264,7 @@ def pick(strategy: str, gv: GridView, robot_xy: Tuple[float, float], *,
     pool = far or cands
     if not pool:
         return None
-    start_xy = start_xy or robot_xy
-    return min(pool, key=lambda c: cost(c, robot_xy, robot_yaw, start_xy,
-                                        gv.resolution))[0]
+    return min(pool, key=lambda c: _mrtsp_cost(c, robot_xy, robot_yaw))[0]
 
 
 def validate(strategy: str) -> str:

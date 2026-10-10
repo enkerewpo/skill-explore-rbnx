@@ -213,11 +213,11 @@ def init(cfg):
     up — so we deliberately don't query atlas for nav / map here. The
     config is checked here, so a bad strategy name fails at boot rather
     than on the first request."""
-    from explore_skill.strategies import validate
+    from explore_skill.strategies import DEFAULT_STRATEGY, validate
     _config.clear()
     _config.update(cfg or {})
-    validate(_config.get("strategy", "nearest"))
-    log.info("CMD_INIT ok (strategy=%s)", _config.get("strategy", "nearest"))
+    strategy = validate(_config.get("strategy") or DEFAULT_STRATEGY)
+    log.info("CMD_INIT ok (strategy=%s)", strategy)
     return Ok()
 
 
@@ -242,7 +242,7 @@ def activate():
             nav_status_endpoint=inputs["nav_status"],
             nav_cancel_endpoint=inputs["nav_cancel"],
             scene_objects_endpoint=optional.get("scene_objects"),
-            strategy=_config.get("strategy", "nearest"),
+            strategy=_config.get("strategy"),
             robot_radius_m=_config.get("robot_radius_m"),
         )
         ctrl.start_runtime()

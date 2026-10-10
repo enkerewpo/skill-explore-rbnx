@@ -24,8 +24,7 @@ def _room(w, h):
     return data
 
 
-@pytest.mark.parametrize("strategy", ["nearest", "mrtsp"])
-def test_a_frontier_behind_a_wall_is_as_far_as_the_way_round(strategy):
+def test_a_frontier_behind_a_wall_is_as_far_as_the_way_round():
     """Straight-line distance puts the frontier just behind the wall first;
     the way round is longer than the walk to the one in the open."""
     data = _room(120, 60)
@@ -33,32 +32,30 @@ def test_a_frontier_behind_a_wall_is_as_far_as_the_way_round(strategy):
     data[5:16, 64:71] = UNKNOWN                # 0.85 m away through the wall
     data[40:56, 5:9] = UNKNOWN                 # 2.9 m away in the open
     robot = (2.5, 0.5)
-    target = pick(strategy, _grid(data), robot, min_size=8,
+    target = pick("mrtsp", _grid(data), robot, min_size=8,
                   robot_radius_m=RADIUS)
     assert target is not None
     assert target.centroid_xy[0] < 3.0
     assert target.goal_xy[0] < 3.0             # goal on the robot's side
 
 
-@pytest.mark.parametrize("strategy", ["nearest", "mrtsp"])
-def test_a_frontier_with_no_way_to_it_is_dropped(strategy):
+def test_a_frontier_with_no_way_to_it_is_dropped():
     data = _room(100, 60)
     data[20:41, 60:81] = WALL
     data[21:40, 61:80] = FREE
     data[25:36, 65:76] = UNKNOWN               # walled in, robot outside
-    assert pick(strategy, _grid(data), (1.0, 1.0), min_size=8,
+    assert pick("mrtsp", _grid(data), (1.0, 1.0), min_size=8,
                 robot_radius_m=RADIUS) is None
 
 
-@pytest.mark.parametrize("strategy", ["nearest", "mrtsp"])
-def test_the_goal_is_short_of_the_frontier_and_faces_it(strategy):
+def test_the_goal_is_short_of_the_frontier_and_faces_it():
     """Down a corridor the goal sits between the robot and the frontier,
     so arriving facing the frontier needs no turn."""
     data = _room(120, 60)
     data[1:-1, 100:-1] = UNKNOWN
     gv = _grid(data)
     robot = (0.5, 1.5)
-    target = pick(strategy, gv, robot, min_size=8, robot_radius_m=RADIUS)
+    target = pick("mrtsp", gv, robot, min_size=8, robot_radius_m=RADIUS)
     gx, gy = target.goal_xy
     fx, fy = target.centroid_xy
     assert gx < fx - 0.4
@@ -71,7 +68,7 @@ def test_goals_keep_the_robot_radius_from_walls():
     data[1:-1, 100:-1] = UNKNOWN
     data[30, 20:90] = WALL                     # a wall down the middle
     gv = _grid(data)
-    target = pick("nearest", gv, (0.5, 0.5), min_size=8,
+    target = pick("mrtsp", gv, (0.5, 0.5), min_size=8,
                   robot_radius_m=RADIUS)
     gy = target.goal_xy[1]
     assert abs(gy - 1.5) > RADIUS and gy > 0.05 + RADIUS

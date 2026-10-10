@@ -141,13 +141,13 @@ class ExploreController:
                  nav_status_endpoint: str,
                  nav_cancel_endpoint: str,
                  scene_objects_endpoint: Optional[str] = None,
-                 strategy: str = "nearest",
+                 strategy: Optional[str] = None,
                  robot_radius_m: Optional[float] = None):
         from .frontier import ROBOT_RADIUS_M
-        from .strategies import validate
+        from .strategies import DEFAULT_STRATEGY, validate
         self.map_topic = map_topic
         # Which frontier to go to next; see strategies.py.
-        self.strategy = validate(strategy)
+        self.strategy = validate(strategy or DEFAULT_STRATEGY)
         self.robot_radius_m = robot_radius_m or ROBOT_RADIUS_M
         # All three nav endpoints typically point at the same FastMCP
         # server (http://host:port/mcp/) — atlas hands us the URL each
@@ -369,11 +369,8 @@ class ExploreController:
                                 total_frontier_count)
         from .strategies import pick
 
-        start_xy = None  # where the robot was when the task began
-
         def pick_target(gv, pose, **kwargs):
             return pick(self.strategy, gv, pose, robot_yaw=pose_xyyaw[2],
-                        start_xy=start_xy or pose,
                         robot_radius_m=self.robot_radius_m, **kwargs)
         log.info("[%s] exploration task starting", handle.task_id)
         # Capture initial state once map is available.
@@ -408,8 +405,6 @@ class ExploreController:
                 time.sleep(0.5)
                 continue
             pose = (pose_xyyaw[0], pose_xyyaw[1]) if pose_xyyaw else None
-            if start_xy is None:
-                start_xy = pose
             gv = GridView.from_msg(latest)
             cur_area = mapped_free_area_m2(gv)
             with self._lock:

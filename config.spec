@@ -12,12 +12,13 @@
 
 config:
   # Which frontier to visit next (explore_skill/strategies.py):
-  #   nearest          explore_lite's cost (3 x path length - frontier
-  #                    length), with path length searched on the map.
-  #   mrtsp            the MRTSP start cost from frontier_exploration_ros2.
+  #   mrtsp            greedy MRTSP from frontier_exploration_ros2: path
+  #                    cost over frontier size, plus a lower bound on the
+  #                    time to get there. Path lengths are searched on the
+  #                    map. Default.
   #   frontier_greedy  the original scorer: size over straight-line
   #                    distance, goal on the straight line to the robot.
-  strategy: nearest
+  strategy: mrtsp
   # Radius of the circle the robot's centre must keep clear of mapped
   # obstacles, in metres. Lite3: 0.235 (half the 0.47 m padded width).
   # Default: 0.22.
